@@ -21,6 +21,7 @@ const db = firebase.firestore(app);
 
 // Reference to the "articles" collection in Firestore
 const articlesCollection = db.collection('articles');
+const commentsCollection = db.collection('comments');
 
 /* ============================================================
    CONSTANTS & STATE
@@ -30,7 +31,7 @@ const EDITOR_PASSWORD = 'admin123';
 const WORDS_PER_MINUTE = 200;
 
 /** @type {'light' | 'dark'} */
-let currentTheme = 'light';
+let currentTheme = 'dark';
 
 /** @type {'home' | 'article' | 'editor'} */
 let currentView = 'home';
@@ -45,7 +46,13 @@ let activeCategoryFilter = 'all';
 let searchQuery = '';
 
 /** @type {boolean} */
-let isEditorAuthenticated = false;
+let isEditorAuthenticated = sessionStorage.getItem('isEditorAuthenticated') === 'true';
+
+/** @type {string | null} - ID of article being edited, null when creating new */
+let editingArticleId = null;
+
+/** @type {string | null} - ID of article pending deletion (for confirm modal) */
+let pendingDeleteArticleId = null;
 
 /**
  * Article schema — structured for Firestore cloud persistence
@@ -66,8 +73,8 @@ let articles = [];
 /** @type {boolean} - Tracks whether initial Firestore fetch has completed */
 let articlesLoaded = false;
 
-/** @type {Record<string, Array<{name: string, text: string, date: string}>>} */
-let commentsByArticle = {};
+/** @type {(() => void) | null} - Unsubscribe function for active comments listener */
+let commentsUnsubscribe = null;
 
 /* ============================================================
    DOM REFERENCES
@@ -99,7 +106,6 @@ const DOM = {
     articleFullDate: document.getElementById('article-full-date'),
     articleFullReadtime: document.getElementById('article-full-readtime'),
     articleBodyContent: document.getElementById('article-body-content'),
-    shareLinkedin: document.getElementById('share-linkedin'),
     downloadPdfBtn: document.getElementById('download-pdf-btn'),
     commentForm: document.getElementById('comment-form'),
     commentName: document.getElementById('comment-name'),
@@ -119,7 +125,15 @@ const DOM = {
     profilePreview: document.getElementById('profile-preview'),
     resetProfileBtn: document.getElementById('reset-profile-btn'),
     toast: document.getElementById('toast'),
-    toastMessage: document.getElementById('toast-message')
+    toastMessage: document.getElementById('toast-message'),
+    deleteModalOverlay: document.getElementById('delete-modal-overlay'),
+    deleteModalTitle: document.getElementById('delete-modal-title'),
+    deleteConfirmBtn: document.getElementById('delete-confirm-btn'),
+    deleteCancelBtn: document.getElementById('delete-cancel-btn'),
+    fullArticleOwnerDot: document.getElementById('full-article-owner-dot'),
+    fullArticleOwnerActions: document.getElementById('full-article-owner-actions'),
+    fullEditBtn: document.getElementById('full-edit-btn'),
+    fullDeleteBtn: document.getElementById('full-delete-btn')
 };
 
 /* ============================================================
@@ -386,6 +400,20 @@ function renderHomepage() {
         card.setAttribute('tabindex', '0');
         card.setAttribute('aria-label', `Read article: ${article.title}`);
 
+        // Build owner action buttons (only shown when authenticated)
+        const ownerActionsHtml = isEditorAuthenticated ? `
+            <div class="card-owner-actions">
+                <button class="card-action-btn card-edit-btn" title="Edit article" aria-label="Edit article">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>
+                    <span>Edit</span>
+                </button>
+                <button class="card-action-btn card-delete-btn" title="Delete article" aria-label="Delete article">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>
+                    <span>Delete</span>
+                </button>
+            </div>
+        ` : '';
+
         card.innerHTML = `
             <div class="card-top-row">
                 <div class="card-icon-square ${article.accentClass}" aria-hidden="true">
@@ -401,7 +429,26 @@ function renderHomepage() {
                     </div>
                 </div>
             </div>
+            ${ownerActionsHtml}
         `;
+
+        // Wire up edit button (stop propagation so card click doesn't fire)
+        const editBtn = card.querySelector('.card-edit-btn');
+        if (editBtn) {
+            editBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                editArticle(article.id);
+            });
+        }
+
+        // Wire up delete button
+        const deleteBtn = card.querySelector('.card-delete-btn');
+        if (deleteBtn) {
+            deleteBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                confirmDeleteArticle(article.id, article.title);
+            });
+        }
 
         card.addEventListener('click', () => navigateToArticle(article.id));
         card.addEventListener('keydown', (e) => {
@@ -481,29 +528,69 @@ function renderArticlePage(articleId) {
     DOM.articleFullReadtime.textContent = `${article.readTimeMinutes} min read`;
     DOM.articleBodyContent.innerHTML = parseLegalBody(article.body);
 
-    updateShareLinks(article);
-    renderComments(articleId);
+    if (isEditorAuthenticated) {
+        DOM.fullArticleOwnerDot?.classList.remove('hidden');
+        DOM.fullArticleOwnerActions?.classList.remove('hidden');
+    } else {
+        DOM.fullArticleOwnerDot?.classList.add('hidden');
+        DOM.fullArticleOwnerActions?.classList.add('hidden');
+    }
+
+    subscribeToComments(articleId);
     renderSidebar();
 }
 
 /**
- * Updates social share intent URLs
- * @param {Article} article
+ * Sets up a real-time listener for comments of a specific article.
+ * @param {string} articleId
  */
-function updateShareLinks(article) {
-    const pageUrl = encodeURIComponent(window.location.href.split('#')[0] + `#/article/${article.id}`);
-    const shareText = encodeURIComponent(`${article.title} — Tejas Ramteke Writes`);
+function subscribeToComments(articleId) {
+    // Unsubscribe from any active comments listener
+    unsubscribeFromComments();
 
-    DOM.shareLinkedin.href = `https://www.linkedin.com/sharing/share-offsite/?url=${pageUrl}`;
-    
+    DOM.commentsList.innerHTML = '';
+    DOM.noCommentsText.classList.add('hidden');
+
+    try {
+        // Query comments belonging to this article. We perform client-side sorting 
+        // to avoid requiring a custom composite Firestore index.
+        commentsUnsubscribe = commentsCollection
+            .where('articleId', '==', articleId)
+            .onSnapshot(
+                (snapshot) => {
+                    const comments = snapshot.docs.map(doc => {
+                        const data = doc.data();
+                        const jsDate = data.timestamp ? data.timestamp.toDate() : new Date();
+                        return {
+                            id: doc.id,
+                            name: data.name,
+                            text: data.text,
+                            timestamp: jsDate.getTime(),
+                            date: jsDate.toISOString()
+                        };
+                    });
+
+                    // Sort comments oldest to newest
+                    comments.sort((a, b) => a.timestamp - b.timestamp);
+
+                    displayComments(comments);
+                },
+                (error) => {
+                    console.error('Error listening to comments:', error);
+                    showToast('Failed to load comments in real-time.');
+                }
+            );
+    } catch (error) {
+        console.error('Error subscribing to comments:', error);
+        showToast('Failed to connect to comments database.');
+    }
 }
 
 /**
- * Renders comments for an article
- * @param {string} articleId
+ * Renders comment items in the UI.
+ * @param {Array<{id: string, name: string, text: string, date: string}>} comments
  */
-function renderComments(articleId) {
-    const comments = commentsByArticle[articleId] || [];
+function displayComments(comments) {
     DOM.commentsList.innerHTML = '';
 
     if (comments.length === 0) {
@@ -523,6 +610,16 @@ function renderComments(articleId) {
         `;
         DOM.commentsList.appendChild(el);
     });
+}
+
+/**
+ * Unsubscribes from the active comments listener.
+ */
+function unsubscribeFromComments() {
+    if (commentsUnsubscribe) {
+        commentsUnsubscribe();
+        commentsUnsubscribe = null;
+    }
 }
 
 /**
@@ -555,6 +652,7 @@ function showView(view) {
 
 function navigateToHome() {
     activeArticleId = null;
+    unsubscribeFromComments();
     showView('home');
     renderHomepage();
     renderSidebar();
@@ -573,6 +671,7 @@ function navigateToArticle(articleId) {
 function navigateToEditor() {
     showView('editor');
     history.replaceState(null, '', '#/editor');
+    updatePublishButtonState();
     [DOM.editorTitle, DOM.editorSubheading, DOM.editorBody].forEach(adjustTextareaHeight);
 }
 
@@ -618,7 +717,9 @@ function validateEditorPassword() {
     
     if (password === EDITOR_PASSWORD) {
         isEditorAuthenticated = true;
+        sessionStorage.setItem('isEditorAuthenticated', 'true');
         closePasswordModal();
+        updateAuthUI();
         navigateToEditor();
         showToast('Welcome to the editor');
         return true;
@@ -636,6 +737,39 @@ function validateEditorPassword() {
 function closePasswordModal() {
     DOM.passwordModalOverlay.classList.remove('active');
     DOM.passwordInput.value = '';
+}
+
+/**
+ * Updates the lock icon, homepage cards, and full article view actions based on authentication status.
+ */
+function updateAuthUI() {
+    // 1. Update the lock icon in the footer
+    if (DOM.footerLockBtn) {
+        if (isEditorAuthenticated) {
+            // Unlock icon (unlocked padlock)
+            DOM.footerLockBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 8-4v4"></path></svg>`;
+            DOM.footerLockBtn.setAttribute('aria-label', 'Logout of editor');
+            DOM.footerLockBtn.setAttribute('title', 'Logout of editor');
+        } else {
+            // Lock icon (locked padlock)
+            DOM.footerLockBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>`;
+            DOM.footerLockBtn.setAttribute('aria-label', 'Access private editor');
+            DOM.footerLockBtn.setAttribute('title', 'Access private editor');
+        }
+    }
+
+    // 2. Refresh the homepage rendering if we are on it, so owner actions appear/disappear
+    if (currentView === 'home') {
+        renderHomepage();
+    }
+
+    // 3. Update full article owner actions
+    if (currentView === 'article' && activeArticleId) {
+        const article = getArticleById(activeArticleId);
+        if (article) {
+            renderArticlePage(activeArticleId);
+        }
+    }
 }
 
 /* ============================================================
@@ -809,6 +943,41 @@ async function saveArticleToFirestore(articleData) {
     }
 }
 
+/**
+ * Deletes an article document from Firestore by ID.
+ * @param {string} articleId
+ * @returns {Promise<boolean>}
+ */
+async function deleteArticleFromFirestore(articleId) {
+    try {
+        await articlesCollection.doc(articleId).delete();
+        console.log('Article deleted from Firestore:', articleId);
+        return true;
+    } catch (error) {
+        console.error('Error deleting article from Firestore:', error);
+        showToast('Failed to delete article. Please try again.');
+        return false;
+    }
+}
+
+/**
+ * Updates an existing article document in Firestore.
+ * @param {string} articleId
+ * @param {Object} articleData
+ * @returns {Promise<boolean>}
+ */
+async function updateArticleInFirestore(articleId, articleData) {
+    try {
+        await articlesCollection.doc(articleId).update(articleData);
+        console.log('Article updated in Firestore:', articleId);
+        return true;
+    } catch (error) {
+        console.error('Error updating article in Firestore:', error);
+        showToast('Failed to update article. Please try again.');
+        return false;
+    }
+}
+
 /* ============================================================
    EDITOR — PUBLISH
    ============================================================ */
@@ -836,6 +1005,11 @@ const privateEditorFields = () => ({
  * @param {{ navigateHome?: boolean }} options
  */
 async function publishArticleFromFields(fields, options = {}) {
+    if (!isEditorAuthenticated) {
+        showToast('Unauthorized: Only the owner can publish or edit articles');
+        return;
+    }
+
     const title = fields.titleEl.value.trim();
     const subheading = fields.subheadingEl.value.trim();
     const category = fields.categoryEl.value;
@@ -852,50 +1026,167 @@ async function publishArticleFromFields(fields, options = {}) {
         return;
     }
 
+    const isEditing = !!editingArticleId;
+
     // Disable publish button to prevent duplicate submissions
     if (DOM.publishBtn) {
         DOM.publishBtn.disabled = true;
-        DOM.publishBtn.textContent = 'Publishing...';
+        DOM.publishBtn.textContent = isEditing ? 'Updating...' : 'Publishing...';
     }
 
-    // Prepare article data for Firestore (no id — Firestore generates it)
+    // Prepare article data for Firestore
     const articleData = {
         title,
         subheading,
         category,
         body,
-        publishedDate: new Date().toISOString().split('T')[0],
         readTimeMinutes: calculateReadTime(body)
-        // Note: accentClass is computed client-side from category, not stored
     };
 
-    // Save to Firestore
-    const docId = await saveArticleToFirestore(articleData);
+    let success = false;
+
+    if (isEditing) {
+        // Update existing article (preserve original publishedDate)
+        success = await updateArticleInFirestore(editingArticleId, articleData);
+    } else {
+        // Create new article
+        articleData.publishedDate = new Date().toISOString().split('T')[0];
+        const docId = await saveArticleToFirestore(articleData);
+        success = !!docId;
+    }
 
     // Re-enable publish button
     if (DOM.publishBtn) {
         DOM.publishBtn.disabled = false;
-        DOM.publishBtn.innerHTML = `
-            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
-            Publish Article
-        `;
     }
 
-    if (docId) {
+    if (success) {
+        const msg = isEditing ? 'Article updated successfully!' : 'Article published successfully!';
         clearEditorFields(fields);
-        showToast('Article published successfully!');
+        editingArticleId = null;
+        updatePublishButtonState();
+        showToast(msg);
 
         // The onSnapshot listener will automatically update the UI,
         // but we navigate home for immediate feedback
         if (options.navigateHome) {
             navigateToHome();
         }
+    } else {
+        updatePublishButtonState();
     }
-    // If docId is null, saveArticleToFirestore already showed an error toast
 }
 
 function publishPrivateArticle() {
     publishArticleFromFields(privateEditorFields(), { navigateHome: true });
+}
+
+/**
+ * Updates the publish button text/icon based on editing vs. creating mode
+ */
+function updatePublishButtonState() {
+    if (!DOM.publishBtn) return;
+    if (editingArticleId) {
+        DOM.publishBtn.innerHTML = `
+            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path><polyline points="17 21 17 13 7 13 7 21"></polyline><polyline points="7 3 7 8 15 8"></polyline></svg>
+            Update Article
+        `;
+    } else {
+        DOM.publishBtn.innerHTML = `
+            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
+            Publish Article
+        `;
+    }
+}
+
+/* ============================================================
+   EDIT & DELETE ARTICLE ACTIONS
+   ============================================================ */
+
+/**
+ * Loads an article into the editor for editing
+ * @param {string} articleId
+ */
+function editArticle(articleId) {
+    if (!isEditorAuthenticated) {
+        showToast('Unauthorized: Only the owner can edit articles');
+        return;
+    }
+
+    const article = getArticleById(articleId);
+    if (!article) {
+        showToast('Article not found');
+        return;
+    }
+
+    // Set editing state
+    editingArticleId = articleId;
+
+    // Populate editor fields with article data
+    DOM.editorTitle.value = article.title;
+    DOM.editorSubheading.value = article.subheading || '';
+    DOM.editorBody.value = article.body;
+    DOM.editorCategory.value = article.category;
+
+    // Navigate to editor
+    navigateToEditor();
+    showToast('Editing: ' + article.title);
+}
+
+/**
+ * Shows the delete confirmation modal
+ * @param {string} articleId
+ * @param {string} articleTitle
+ */
+function confirmDeleteArticle(articleId, articleTitle) {
+    if (!isEditorAuthenticated) {
+        showToast('Unauthorized: Only the owner can delete articles');
+        return;
+    }
+
+    pendingDeleteArticleId = articleId;
+    if (DOM.deleteModalTitle) {
+        DOM.deleteModalTitle.textContent = articleTitle;
+    }
+    if (DOM.deleteModalOverlay) {
+        DOM.deleteModalOverlay.classList.add('active');
+    }
+}
+
+/**
+ * Closes the delete confirmation modal
+ */
+function closeDeleteModal() {
+    pendingDeleteArticleId = null;
+    if (DOM.deleteModalOverlay) {
+        DOM.deleteModalOverlay.classList.remove('active');
+    }
+}
+
+/**
+ * Executes the pending article deletion
+ */
+async function executeDeleteArticle() {
+    if (!isEditorAuthenticated) {
+        showToast('Unauthorized: Only the owner can delete articles');
+        return;
+    }
+    if (!pendingDeleteArticleId) return;
+
+    const articleId = pendingDeleteArticleId;
+    closeDeleteModal();
+
+    showToast('Deleting article...');
+    const success = await deleteArticleFromFirestore(articleId);
+
+    if (success) {
+        showToast('Article deleted successfully');
+        // If currently viewing the deleted article, go home
+        if (activeArticleId === articleId) {
+            navigateToHome();
+        }
+        // onSnapshot will automatically update the UI
+    }
 }
 
 /* ============================================================
@@ -995,9 +1286,27 @@ function initEventListeners() {
     });
 
     DOM.backToHome.addEventListener('click', navigateToHome);
-    DOM.backFromEditor.addEventListener('click', navigateToHome);
+    DOM.backFromEditor.addEventListener('click', () => {
+        // Clear editing state when leaving editor
+        editingArticleId = null;
+        updatePublishButtonState();
+        clearEditorFields(privateEditorFields());
+        navigateToHome();
+    });
 
-    DOM.footerLockBtn.addEventListener('click', promptEditorAccess);
+    DOM.footerLockBtn.addEventListener('click', () => {
+        if (isEditorAuthenticated) {
+            isEditorAuthenticated = false;
+            sessionStorage.removeItem('isEditorAuthenticated');
+            updateAuthUI();
+            showToast('Logged out of editor');
+            if (currentView === 'editor') {
+                navigateToHome();
+            }
+        } else {
+            promptEditorAccess();
+        }
+    });
 
     DOM.passwordForm?.addEventListener('submit', (e) => {
         e.preventDefault();
@@ -1015,11 +1324,35 @@ function initEventListeners() {
     DOM.profilePicInput?.addEventListener('change', handleProfilePictureUpload);
     DOM.resetProfileBtn?.addEventListener('click', resetProfilePicture);
 
+    // Delete confirmation modal events
+    DOM.deleteConfirmBtn?.addEventListener('click', executeDeleteArticle);
+    DOM.deleteCancelBtn?.addEventListener('click', closeDeleteModal);
+    DOM.deleteModalOverlay?.addEventListener('click', (e) => {
+        if (e.target === DOM.deleteModalOverlay) {
+            closeDeleteModal();
+        }
+    });
+
     DOM.publishBtn?.addEventListener('click', publishPrivateArticle);
 
     DOM.downloadPdfBtn?.addEventListener('click', downloadArticlePdf);
 
-    DOM.commentForm?.addEventListener('submit', (e) => {
+    DOM.fullEditBtn?.addEventListener('click', () => {
+        if (activeArticleId) {
+            editArticle(activeArticleId);
+        }
+    });
+
+    DOM.fullDeleteBtn?.addEventListener('click', () => {
+        if (activeArticleId) {
+            const article = getArticleById(activeArticleId);
+            if (article) {
+                confirmDeleteArticle(activeArticleId, article.title);
+            }
+        }
+    });
+
+    DOM.commentForm?.addEventListener('submit', async (e) => {
         e.preventDefault();
         if (!activeArticleId) return;
 
@@ -1027,20 +1360,32 @@ function initEventListeners() {
         const text = DOM.commentText.value.trim();
         if (!name || !text) return;
 
-        if (!commentsByArticle[activeArticleId]) {
-            commentsByArticle[activeArticleId] = [];
+        const submitBtn = DOM.commentForm.querySelector('.comment-submit-btn');
+        if (submitBtn) {
+            submitBtn.disabled = true;
+            submitBtn.textContent = 'Posting...';
         }
 
-        commentsByArticle[activeArticleId].push({
-            name,
-            text,
-            date: new Date().toISOString().split('T')[0]
-        });
+        try {
+            await commentsCollection.add({
+                name,
+                text,
+                articleId: activeArticleId,
+                timestamp: firebase.firestore.FieldValue.serverTimestamp()
+            });
 
-        DOM.commentName.value = '';
-        DOM.commentText.value = '';
-        renderComments(activeArticleId);
-        showToast('Comment posted');
+            DOM.commentName.value = '';
+            DOM.commentText.value = '';
+            showToast('Comment posted successfully');
+        } catch (error) {
+            console.error('Error posting comment:', error);
+            showToast('Failed to post comment. Please try again.');
+        } finally {
+            if (submitBtn) {
+                submitBtn.disabled = false;
+                submitBtn.textContent = 'Post Comment';
+            }
+        }
     });
 
     const allEditorTextareas = [
@@ -1069,6 +1414,9 @@ function initEventListeners() {
 function init() {
     initEventListeners();
     loadProfilePicture();
+    
+    // Set initial authorization state UI
+    updateAuthUI();
 
     // Start the real-time Firestore listener (replaces old in-memory array)
     // This will fetch all articles from the cloud and keep them synced

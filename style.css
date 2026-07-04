@@ -1508,6 +1508,199 @@ body.dark-mode .icon-moon { display: none; }
 }
 
 /* ============================================================
+   CARD OWNER ACTIONS (Edit / Delete)
+   ============================================================ */
+.card-owner-actions {
+    display: flex;
+    gap: 0.5rem;
+    padding: 0 1.25rem 1rem;
+    justify-content: flex-end;
+    border-top: 1px solid var(--border-color);
+    padding-top: 0.75rem;
+    margin: 0 0.25rem;
+}
+
+.card-action-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.4rem 0.85rem;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-sm);
+    background-color: transparent;
+    color: var(--text-muted);
+    font-size: 0.75rem;
+    font-weight: 500;
+    font-family: inherit;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    line-height: 1;
+}
+
+.card-action-btn svg {
+    flex-shrink: 0;
+}
+
+.card-edit-btn:hover {
+    color: var(--accent-color);
+    border-color: var(--accent-color);
+    background-color: var(--accent-glow);
+}
+
+.card-delete-btn:hover {
+    color: #ef4444;
+    border-color: #ef4444;
+    background-color: rgba(239, 68, 68, 0.08);
+}
+
+body.dark-mode .card-delete-btn:hover {
+    color: #f87171;
+    border-color: #f87171;
+    background-color: rgba(248, 113, 113, 0.12);
+}
+
+.full-article-owner-actions {
+    display: inline-flex;
+    gap: 0.65rem;
+    align-items: center;
+}
+
+.full-action-btn {
+    background: none;
+    border: none;
+    font-size: 0.8125rem;
+    font-weight: 600;
+    cursor: pointer;
+    font-family: inherit;
+    padding: 0 0.25rem;
+    line-height: 1;
+    transition: var(--transition-fast);
+}
+
+.full-edit-btn {
+    color: var(--accent-color);
+}
+.full-edit-btn:hover {
+    color: var(--accent-hover);
+    text-decoration: underline;
+}
+
+.full-delete-btn {
+    color: #ef4444;
+}
+.full-delete-btn:hover {
+    color: #dc2626;
+    text-decoration: underline;
+}
+
+body.dark-mode .full-delete-btn {
+    color: #f87171;
+}
+body.dark-mode .full-delete-btn:hover {
+    color: #ef4444;
+}
+
+/* ============================================================
+   DELETE CONFIRMATION MODAL
+   ============================================================ */
+.delete-modal-overlay {
+    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: rgba(0, 0, 0, 0.6);
+    z-index: 2000;
+    align-items: center;
+    justify-content: center;
+    animation: fadeIn 0.2s ease;
+}
+
+.delete-modal-overlay.active {
+    display: flex;
+}
+
+.delete-modal {
+    background-color: var(--card-bg);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-lg);
+    padding: 2rem;
+    max-width: 420px;
+    width: 90%;
+    box-shadow: var(--shadow-xl);
+    animation: slideIn 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    text-align: center;
+}
+
+.delete-modal-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 56px;
+    height: 56px;
+    border-radius: 50%;
+    background-color: rgba(239, 68, 68, 0.1);
+    color: #ef4444;
+    margin-bottom: 1rem;
+}
+
+body.dark-mode .delete-modal-icon {
+    background-color: rgba(248, 113, 113, 0.15);
+    color: #f87171;
+}
+
+.delete-modal h2 {
+    color: var(--text-heading);
+    font-size: 1.25rem;
+    margin-bottom: 0.5rem;
+    font-weight: 600;
+}
+
+.delete-modal-subtitle {
+    color: var(--text-muted);
+    font-size: 0.875rem;
+    margin-bottom: 0.75rem;
+}
+
+.delete-modal-article-title {
+    color: var(--text-heading);
+    font-size: 0.9375rem;
+    font-weight: 600;
+    padding: 0.5rem 0.75rem;
+    background-color: var(--bg-secondary);
+    border-radius: var(--radius-sm);
+    margin-bottom: 0.5rem;
+    word-break: break-word;
+}
+
+.delete-modal-warning {
+    color: #ef4444;
+    font-size: 0.8125rem;
+    font-weight: 500;
+    margin-bottom: 1.5rem;
+}
+
+body.dark-mode .delete-modal-warning {
+    color: #f87171;
+}
+
+.delete-modal-actions {
+    display: flex;
+    gap: 0.75rem;
+    justify-content: center;
+}
+
+.modal-delete-btn {
+    background-color: #ef4444;
+    color: #ffffff;
+}
+
+.modal-delete-btn:hover {
+    background-color: #dc2626;
+}
+
+/* ============================================================
    TOAST NOTIFICATION
    ============================================================ */
 .toast {
