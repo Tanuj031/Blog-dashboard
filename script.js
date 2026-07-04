@@ -1,3 +1,30 @@
+/* ============================================================
+   FIREBASE CONFIGURATION & INITIALIZATION
+   ============================================================ */
+
+// TODO: Update Firestore security rules before production to restrict write access to authenticated owner only
+// Current Firestore rules should be in "test mode" (allow read/write) for development
+
+const firebaseConfig = {
+    apiKey: "AIzaSyAF8iFIK9d8pG-qeWljUAP5AJOUmaXrl4E",
+    authDomain: "legal-blog-cada8.firebaseapp.com",
+    projectId: "legal-blog-cada8",
+    storageBucket: "legal-blog-cada8.firebasestorage.app",
+    messagingSenderId: "200974115018",
+    appId: "1:200974115018:web:fe5714033bbbcda85f1433",
+    measurementId: "G-ELMMENN7CL"
+};
+
+// Initialize Firebase App & Firestore
+const app = firebase.initializeApp(firebaseConfig);
+const db = firebase.firestore(app);
+
+// Reference to the "articles" collection in Firestore
+const articlesCollection = db.collection('articles');
+
+/* ============================================================
+   CONSTANTS & STATE
+   ============================================================ */
 
 const EDITOR_PASSWORD = 'admin123';
 const WORDS_PER_MINUTE = 200;
@@ -21,9 +48,9 @@ let searchQuery = '';
 let isEditorAuthenticated = false;
 
 /**
- * Article schema — structured for future backend/CMS integration
+ * Article schema — structured for Firestore cloud persistence
  * @typedef {Object} Article
- * @property {string} id
+ * @property {string} id           - Firestore document ID
  * @property {string} title
  * @property {string} subheading
  * @property {string} category
@@ -33,8 +60,11 @@ let isEditorAuthenticated = false;
  * @property {string} accentClass
  */
 
-/** @type {Article[]} */
+/** @type {Article[]} - Local cache of articles synced from Firestore in real-time */
 let articles = [];
+
+/** @type {boolean} - Tracks whether initial Firestore fetch has completed */
+let articlesLoaded = false;
 
 /** @type {Record<string, Array<{name: string, text: string, date: string}>>} */
 let commentsByArticle = {};
@@ -111,14 +141,6 @@ function getCategoryAccentClass(category) {
         'Other': 'category-other'
     };
     return map[category] || 'category-other';
-}
-
-/**
- * Generates a unique article ID
- * @returns {string}
- */
-function generateArticleId() {
-    return `article-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 }
 
 /**
@@ -274,7 +296,7 @@ function getFilteredArticles() {
 }
 
 /**
- * Finds article by ID
+ * Finds article by ID from local cache
  * @param {string} id
  * @returns {Article | undefined}
  */
@@ -295,9 +317,42 @@ function getArticleIconSvg() {
 }
 
 /**
+ * Shows a loading indicator in the articles grid while fetching from Firestore
+ */
+function showLoadingState() {
+    DOM.articlesGrid.innerHTML = `
+        <div class="loading-state" style="grid-column: 1 / -1; text-align: center; padding: 3rem 1rem; color: var(--text-muted, #6b7280);">
+            <div class="loading-spinner" style="
+                width: 36px; height: 36px; margin: 0 auto 1rem;
+                border: 3px solid var(--border-color, #e5e7eb);
+                border-top-color: var(--accent-color, #8b5cf6);
+                border-radius: 50%;
+                animation: spin 0.8s linear infinite;
+            "></div>
+            <p style="font-size: 0.95rem; font-weight: 500;">Loading articles...</p>
+        </div>
+    `;
+    DOM.emptyStateHome.classList.add('hidden');
+
+    // Inject spinner keyframes if not already present
+    if (!document.getElementById('loading-spinner-style')) {
+        const style = document.createElement('style');
+        style.id = 'loading-spinner-style';
+        style.textContent = `@keyframes spin { to { transform: rotate(360deg); } }`;
+        document.head.appendChild(style);
+    }
+}
+
+/**
  * Renders homepage article preview cards
  */
 function renderHomepage() {
+    // If articles haven't loaded from Firestore yet, show loading state
+    if (!articlesLoaded) {
+        showLoadingState();
+        return;
+    }
+
     const filtered = getFilteredArticles();
     DOM.articlesGrid.innerHTML = '';
 
@@ -665,6 +720,96 @@ function resetProfilePicture() {
 }
 
 /* ============================================================
+   FIRESTORE — REAL-TIME LISTENER (onSnapshot)
+   ============================================================
+   Listens to the "articles" collection in real-time.
+   Any changes (add, modify, delete) from any client are
+   automatically reflected in all open browser tabs.
+   ============================================================ */
+
+/**
+ * Sets up a real-time Firestore listener on the "articles" collection.
+ * This replaces the old in-memory array approach — articles are now
+ * fetched from the cloud and kept in sync automatically.
+ */
+function subscribeToArticles() {
+    // Show loading state on first load
+    showLoadingState();
+
+    // onSnapshot() listens for real-time updates from Firestore
+    // Sorted by publishedDate descending (newest first)
+    try {
+        articlesCollection
+            .orderBy('publishedDate', 'desc')
+            .onSnapshot(
+                (snapshot) => {
+                    // Convert Firestore snapshot to local Article array
+                    articles = snapshot.docs.map(doc => ({
+                        id: doc.id,               // Use Firestore document ID
+                        ...doc.data(),             // Spread all document fields
+                        accentClass: getCategoryAccentClass(doc.data().category)
+                    }));
+
+                    // Mark initial load as complete
+                    articlesLoaded = true;
+
+                    // Re-render the UI with the latest data
+                    renderHomepage();
+                    renderSidebar();
+
+                    // If user is currently viewing an article, refresh it too
+                    if (currentView === 'article' && activeArticleId) {
+                        const stillExists = articles.find(a => a.id === activeArticleId);
+                        if (stillExists) {
+                            renderArticlePage(activeArticleId);
+                        } else {
+                            // Article was deleted — navigate home
+                            navigateToHome();
+                        }
+                    }
+                },
+                (error) => {
+                    console.error('Firestore onSnapshot error:', error);
+                    articlesLoaded = true; // Stop loading state even on error
+                    showToast('Failed to load articles. Check your connection.');
+                    renderHomepage();
+                    renderSidebar();
+                }
+            );
+    } catch (error) {
+        console.error('Failed to subscribe to Firestore:', error);
+        articlesLoaded = true;
+        showToast('Failed to connect to database.');
+        renderHomepage();
+        renderSidebar();
+    }
+}
+
+/* ============================================================
+   FIRESTORE — PUBLISH ARTICLE (write to cloud)
+   ============================================================ */
+
+/**
+ * Saves an article document to the Firestore "articles" collection.
+ * The onSnapshot listener will automatically pick up the new document
+ * and update the UI across all open tabs.
+ *
+ * @param {Object} articleData - The article fields to save
+ * @returns {Promise<string|null>} - The new document ID, or null on failure
+ */
+async function saveArticleToFirestore(articleData) {
+    try {
+        const docRef = await articlesCollection.add(articleData);
+        console.log('Article saved to Firestore with ID:', docRef.id);
+        return docRef.id;
+    } catch (error) {
+        console.error('Error saving article to Firestore:', error);
+        showToast('Failed to publish article. Please try again.');
+        return null;
+    }
+}
+
+/* ============================================================
    EDITOR — PUBLISH
    ============================================================ */
 
@@ -685,11 +830,12 @@ const privateEditorFields = () => ({
 });
 
 /**
- * Creates and publishes an article from editor field values
+ * Creates and publishes an article from editor field values.
+ * Saves to Firestore instead of an in-memory array.
  * @param {{ titleEl: HTMLTextAreaElement, subheadingEl: HTMLTextAreaElement, categoryEl: HTMLSelectElement, bodyEl: HTMLTextAreaElement }} fields
  * @param {{ navigateHome?: boolean }} options
  */
-function publishArticleFromFields(fields, options = {}) {
+async function publishArticleFromFields(fields, options = {}) {
     const title = fields.titleEl.value.trim();
     const subheading = fields.subheadingEl.value.trim();
     const category = fields.categoryEl.value;
@@ -706,27 +852,46 @@ function publishArticleFromFields(fields, options = {}) {
         return;
     }
 
-    const newArticle = {
-        id: generateArticleId(),
+    // Disable publish button to prevent duplicate submissions
+    if (DOM.publishBtn) {
+        DOM.publishBtn.disabled = true;
+        DOM.publishBtn.textContent = 'Publishing...';
+    }
+
+    // Prepare article data for Firestore (no id — Firestore generates it)
+    const articleData = {
         title,
         subheading,
         category,
         body,
         publishedDate: new Date().toISOString().split('T')[0],
-        readTimeMinutes: calculateReadTime(body),
-        accentClass: getCategoryAccentClass(category)
+        readTimeMinutes: calculateReadTime(body)
+        // Note: accentClass is computed client-side from category, not stored
     };
 
-    articles.unshift(newArticle);
-    clearEditorFields(fields);
-    showToast('Article published successfully!');
+    // Save to Firestore
+    const docId = await saveArticleToFirestore(articleData);
 
-    if (options.navigateHome) {
-        navigateToHome();
-    } else {
-        renderHomepage();
-        renderSidebar();
+    // Re-enable publish button
+    if (DOM.publishBtn) {
+        DOM.publishBtn.disabled = false;
+        DOM.publishBtn.innerHTML = `
+            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
+            Publish Article
+        `;
     }
+
+    if (docId) {
+        clearEditorFields(fields);
+        showToast('Article published successfully!');
+
+        // The onSnapshot listener will automatically update the UI,
+        // but we navigate home for immediate feedback
+        if (options.navigateHome) {
+            navigateToHome();
+        }
+    }
+    // If docId is null, saveArticleToFirestore already showed an error toast
 }
 
 function publishPrivateArticle() {
@@ -904,8 +1069,12 @@ function initEventListeners() {
 function init() {
     initEventListeners();
     loadProfilePicture();
-    renderHomepage();
-    renderSidebar();
+
+    // Start the real-time Firestore listener (replaces old in-memory array)
+    // This will fetch all articles from the cloud and keep them synced
+    subscribeToArticles();
+
+    // Handle initial route (after articles start loading)
     handleRoute();
 }
 
